@@ -176,6 +176,7 @@ if __name__ == "__main__":
         input_example["c"]=jet_example
     if args.multi_loss and args.architecture!="Transformer" and args.architecture!="MDN": 
         input_example["pad_mask"]=mask_example
+    if args.multi_loss:
         mask_shape=mask_example.shape
 
     # construct model
@@ -199,10 +200,10 @@ if __name__ == "__main__":
       modelstats=summary(model, input_data=input_example, col_names=["input_size","output_size","num_params","params_percent","mult_adds","trainable"], mode="train")
       print("Output shape,", model(**input_example).shape,flush=True)
     elif args.architecture=="Transformer" or args.architecture=="MDN":
+      modelstats=summary(model, input_data=input_example, col_names=["input_size","output_size","num_params","params_percent","mult_adds","trainable"])
       if args.conditional:
-          modelstats=summary(model, input_data=input_example, col_names=["input_size","output_size","num_params","params_percent","mult_adds","trainable"])
           output_example=model(**input_example)
-          if args.multi_loss:
+          if isinstance(output_example, tuple): #multi-loss and lund-tree models also return the stop/split logits
             print("Output shape,", output_example[0].shape,output_example[-1].shape, flush=True)
           else:
             print("Output shape,", output_example.shape, flush=True)

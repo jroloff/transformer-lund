@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import models_generative
 
 import helpers
+import lund_tree_encoding
 
 # ---------------------------------------------------------------------
 # Data loaders
@@ -187,6 +188,71 @@ class constit_relative_dataset(torch.utils.data.Dataset):
   def __len__(self):
     return len(self.ptfrac)
 
+class lundtree_dataset(torch.utils.data.Dataset):
+  """
+  Full Lund trees from prepare_jetclass_tree_sample.py as depth-first preorder token sequences [Nnodes, Nfeat+Ncontext+1]:
+  model-space node features (lund_tree_encoding), the input-only context of the next node and a split flag
+  (1=split, 0=leaf). Padded nodes are -1.
+  Always returns [tokens, jet, mask] with jet=[pt, eta, phi] and mask True for padded nodes.
+  The nodes carry only the split features, the jet fixes the absolute kinematics.
+  The prepared tokens are cached next to the HDF5 file, max_events reads only the first jets.
+  """
+  CACHE_VERSION = 6 #bump when the token preparation changes, to rebuild existing caches
+
+  def __init__(self, file_path, max_events=None):
+    super(lundtree_dataset, self).__init__()
+
+    cache_path = f"{file_path}.cache.npz"
+    source = os.stat(file_path)
+    stamp = np.array([self.CACHE_VERSION, source.st_size, source.st_mtime_ns], dtype=np.int64)
+    if os.path.exists(cache_path):
+      cache = np.load(cache_path)
+      if np.array_equal(cache["stamp"], stamp):
+        stop = max_events if max_events is not None else len(cache["tokens"])
+        self.tokens, self.mask, self.jet = cache["tokens"][:stop], cache["mask"][:stop], cache["jet"][:stop]
+        return
+
+    self._prepare(file_path, max_events)
+    if max_events is None:
+      #Write to a temporary file first, so an interrupted run never leaves a partial cache
+      temporary = cache_path + ".tmp.npz"
+      np.savez_compressed(temporary, tokens=self.tokens, mask=self.mask, jet=self.jet, stamp=stamp)
+      os.replace(temporary, cache_path)
+
+  def _prepare(self, file_path, max_events):
+    f = h5py.File(file_path,'r')
+    tree=f["lund_tree"]
+    rows = slice(0, max_events)
+    stored_names=[name.strip() for name in tree.attrs["feature_order"].split(",")]
+    features=tree["features"][rows][..., [stored_names.index(name) for name in lund_tree_encoding.SPLIT_FEATURE_NAMES]]
+    splits=tree["split"][rows]
+    lengths=tree["length"][rows]
+
+    #Encode the split features into the unbounded model space, leaves stay zero.
+    #Each split's delta_R is bounded relative to its parent's (C/A angular ordering, see lund_tree_encoding.TreeWalker).
+    #The input-only context of the next node (depth, soft child, pT fraction) is stored with the current node since inputs are shifted by one
+    features, context = lund_tree_encoding.encode_trees(features, splits)
+    features, context = features.astype(np.float32), context.astype(np.float32)
+
+    #Padding is defined by the tree length (and marked by split flag -1), never by feature values: -1 is a valid encoded feature
+    self.mask = np.arange(features.shape[1])[None, :] >= lengths[:, None]
+    self.tokens = np.concatenate([features, context, splits[..., None].astype(np.float32)], axis=-1).astype(np.float32)
+    self.tokens[self.mask] = -1
+
+    #Jet conditioning
+    jet_px, jet_py, jet_pz = [f["jet"][name][rows].astype(np.float64) for name in ("PX", "PY", "PZ")]
+    eps=1e-12
+    jet_pt = np.hypot(jet_px, jet_py)
+    jet_eta = np.arcsinh(jet_pz / np.maximum(jet_pt, eps))
+    jet_phi = np.arctan2(jet_py, jet_px)
+    self.jet = np.stack([jet_pt, jet_eta, jet_phi], axis=-1).astype(np.float32)
+
+  def __getitem__(self, index):
+    return [torch.from_numpy(self.tokens[index]), torch.from_numpy(self.jet[index]), torch.from_numpy(self.mask[index])]
+
+  def __len__(self):
+    return len(self.tokens)
+
 def get_loaders(args):
 
   if args.input_format=="ktdr":
@@ -205,6 +271,12 @@ def get_loaders(args):
     train_dataset = constit_relative_dataset(args.train_file, NConstituents=args.num_constituents, add_mask=args.multi_loss, add_conditional=True, preprocess=args.preprocess)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=args.shuffle)
     test_dataset = constit_relative_dataset(args.val_file, NConstituents=args.num_constituents, add_mask=args.multi_loss, add_conditional=True, preprocess=args.preprocess)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=args.shuffle)
+
+  elif args.input_format=="lundtree":
+    train_dataset = lundtree_dataset(args.train_file)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=args.shuffle)
+    test_dataset = lundtree_dataset(args.val_file)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=args.shuffle)
 
   return train_loader,test_loader
@@ -451,6 +523,21 @@ def build_unbinned_model(args_or_dict, input_shape, cond_shape):
             elif args_or_dict.preprocess=="log":
                 max_value=11
 
+        if args_or_dict.input_format=="lundtree":
+            return models_generative.model_autoregressive_tree_MDN(
+                input_dim=input_shape[2],
+                cond_dim=cond_shape[-1],
+                n_mix=_as_int(_config_get(args_or_dict,"MDN_nmix")),
+                embed_dim=_as_int(_config_get(args_or_dict,"embed_dim")),
+                num_heads=_as_int(_config_get(args_or_dict,"num_heads")),
+                num_layers=_as_int(_config_get(args_or_dict,"num_layers")),
+                ff_dim=_as_int(_config_get(args_or_dict,"ff_dim")),
+                max_range=max_value,
+                pad_value=pad_value,
+                #varphi is the same column whether or not the absolute node features follow the split ones
+                circular_dims=[lund_tree_encoding.VARPHI],
+            )
+
         return models_generative.model_autoregressive_transformer_MDN(
             input_dim=input_shape[2],
             cond_dim=cond_shape[-1],
@@ -598,7 +685,6 @@ def save_checkpoint(
         )
 
     #Actually save it
-    torch.save(checkpoint_info, ckpt_path)
     save_torchpickle(checkpoint_info, ckpt_path)
     print(f"Saved checkpoint to {ckpt_path}", flush=True)
     if is_best:  # if best save to it's own file
@@ -808,7 +894,7 @@ def parse_input():
     parser.add_argument("--num-workers", type=int, default=1, help="DataLoader workers")
     parser.add_argument("--shuffle", action="store_true", default=True, help="Shuffle training loader (default: True)")
     parser.add_argument("--no-shuffle", dest="shuffle", action="store_false", help="Disable shuffle")
-    parser.add_argument("--input_format", type=str, choices=["ktdr","4vec","relvec"], default="ktdr", help="What format of inputs we are using")
+    parser.add_argument("--input_format", type=str, choices=["ktdr","4vec","relvec","lundtree"], default="ktdr", help="What format of inputs we are using")
     parser.add_argument("--preprocess", type=str, default=None, help="Preprocess the output (default: lNone")
     parser.add_argument("--flatten", action="store_true", default=False, help="Flatten the energy during training (default: False)")
     parser.add_argument("--num-constituents", type=int, default=20, help="Number of constituents")
@@ -875,7 +961,7 @@ def parse_input():
     parser.add_argument("--SDE-type", type=str, default="sde", choices=["sde","ode"], help="Algorithm for the SDE")
 
     # misc
-    parser.add_argument("--device", default=None, choices=[None, "cpu", "cuda"], help="Force device; default auto")
+    parser.add_argument("--device", default=None, choices=[None, "cpu", "cuda", "mps"], help="Force device; default auto")
     parser.add_argument("--multi-loss-plot", action="store_true", default=False, help="Log multiple loss definitions without affecting main training")
     parser.add_argument("--mask-bad", action="store_true", default=False, help="Mask bad generated consitiuents")
 
@@ -886,6 +972,7 @@ def parse_input():
     parser.add_argument("--model-checkpoint", "--checkpoint", type=str, nargs="+",default=[],help="Path(s) to model/checkpoint to load")
     
     # plotting options
+    parser.add_argument("--from-samples", type=str, default=None, help="validate_unbinned.py: remake the plots from a validation_samples.npz saved by an earlier validation, without a model")
     parser.add_argument("--validation-size",type=int, default=100000, help="How many images to generate and make plots for")
     parser.add_argument("--hist2d-xrange", type=float, nargs=2, default=[-1,10], help="2D Lund histogram x range: xmin xmax",)
     parser.add_argument("--hist2d-yrange", type=float, nargs=2, default=[-5,7], help="2D Lund histogram y range: ymin ymax",)

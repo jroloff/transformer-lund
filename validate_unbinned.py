@@ -12,6 +12,19 @@ if __name__ == "__main__":
     ignore_list=[]
     for argv in sys.argv[1:]:
         if "--" in argv: ignore_list.append(argv.replace("--","").replace("-","_"))
+
+    #Remake the plots from saved samples, with their run arguments unless given on the command line
+    if args.from_samples:
+        samples = load_validation_samples(args.from_samples)
+        for key, value in samples.pop("saved_args").items():
+            if hasattr(args, key) and key not in ignore_list and key != "from_samples":
+                setattr(args, key, value)
+        if "plot_dir" not in ignore_list:
+            args.plot_dir = os.path.dirname(os.path.abspath(args.from_samples))
+        plot_validation_samples(args=args, **samples)
+        print("Done")
+        sys.exit(0)
+
     load_checkpoint_args(args,ignore_args=ignore_list)
     set_seeds(args.seed)
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device is None else args.device
